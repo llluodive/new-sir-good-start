@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>磁极 POLARITY v2.0</title>
+<style>
+ html,body{margin:0;height:100%;background:#000;overflow:hidden}
+ canvas{display:block;position:absolute;inset:0}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+'use strict';
+/* ================= 基础 ================= */
+const VW=480,VH=272,TILE=16,STEP=1/60,fl=Math.floor,R=Math.round;
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+const wc=document.createElement('canvas');wc.width=VW;wc.height=VH;
+const wg=wc.getContext('2d');wg.imageSmoothingEnabled=false;
+const clamp=(v,a,b)=>v<a?a:v>b?b:v,lerp=(a,b,t)=>a+(b-a)*t;
+let VIEW={s:2,ox:0,oy:0},camRX=0;
+
+/* ================= 可调参数（F1 面板实时调） ================= */
+const P={gravity:1400,moveAccel:1800,maxRun:140,friction:1800,airControl:0.65,
+ jumpVel:380,maxFall:460,fastFall:1.6,
+ magA:1700,magR:200,maxSpeed:280,            // v2：磁力减半
+ wallPull:1300,wallRange:34,climbSpd:85,wallKick:260,wallCool:0.3,peelT:0.15};
+const DBG=[['gravity',600,2600,50],['moveAccel',600,3600,50],['maxRun',80,260,5],
+ ['jumpVel',260,560,10],['magA',500,4500,50],['magR',80,340,10],['maxSpeed',150,700,10],
+ ['wallPull',400,3000,50],['wallRange',16,64,2],['climbSpd',40,200,5],['wallKick',120,500,10]];
+
+/* ================= 全局状态 ================= */
+const keys={};let jumpBuf=0,switchQ=false,debugOn=false,dbgSel=0,paused=false,muted=false;
+let state='title',time=0,deaths=0,curCP=-1,gtime=0,deathAt=-99;
+let plPX=0,plPY=0,camX=0,camPX=0;
+
+/* ================= 音频（实时合成） ================= */
+const AU={ctx:null,
+ init(){if(this.ctx){if(this.ctx.state==='suspended')this.ctx.resume();return;}
+  const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
+  const c=this.ctx=new AC();
+  this.master=c.createGain();this.master.gain.value=0.8;this.master.connect(c.destination);
+  this.sfx=c.createGain();this.sfx.gain.value=0.9;this.sfx.connect(this.master);
+  this.mus=c.createGain();this.mus.gain.value=0.4;this.mus.connect(this.master);
+  const len=(c.sampleRate*0.25)|0,buf=c.createBuffer(1,len,c.sampleRate),d=buf.getChannelData(0);
+  for(let i=0;i<len;i++)d[i]=Math.random()*2-1;this.noise=buf;
+  this.humO=c.createOscillator();this.humO.type='triangle';this.humO.frequency.value=48;
+  this.humG=c.createGain();this.humG.gain.value=0;
+  this.humO.connect(this.humG);this.humG.connect(this.master);this.humO.start();
+  this.step=0;this.nextT=c.currentTime+0.1;setInterval(()=>this.sched(),30);},
+ setMute(m){if(this.ctx)this.master.gain.setTargetAtTime(m?0:0.8,this.ctx.currentTime,0.02);},
+ tone(f,at,dur,type,vol,slide,dest){if(!this.ctx)return;const c=this.ctx,
+  o=c.createOscillator(),g=c.createGain();
+  o.type=type;o.frequency.setValueAtTime(f,at);
+  if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(20,slide),at+dur);
+  g.gain.setValueAtTime(0.0001,at);g.gain.exponentialRampToValueAtTime(vol,at+0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001,at+dur);
+  o.connect(g);g.connect(dest||this.sfx);o.start(at);o.stop(at+dur+0.05);},
+ nz(at,dur,vol,type,fq,dest){if(!this.ctx)return;const c=this.ctx,s=c.createBufferSource();
+  s.buffer=this.noise;s.loop=true;
+  const f=c.createBiquadFilter();f.type=type;f.frequency.value=fq;
+  const g=c.createGain();g.gain.setValueAtTime(vol,at);
+  g.gain.exponentialRampToValueAtTime(0.0001,at+dur);
+  s.connect(f);f.connect(g);g.connect(dest||this.sfx);s.start(at);s.stop(at+dur+0.05);},
+ hum(v){if(!this.ctx)return;const t=this.ctx.currentTime;
+  this.humG.gain.setTargetAtTime(0.07*v,t,0.06);
+  this.humO.frequency.setTargetAtTime(46+60*v,t,0.08);},
+ sched(){if(!this.ctx)return;const c=this.ctx;
+  while(this.nextT<c.currentTime+0.15){this.bar(this.step,this.nextT);
+   this.nextT+=0.25;this.step=(this.step+1)%32;}},
+ bar(s,t){
+  const BASS=[110,0,110,220,0,110,0,220,87.31,0,87.31,174.62,0,87.31,0,174.62,
+   130.81,0,130.81,261.62,0,130.81,0,261.62,98,0,98,196,0,98,196,0];
+  const LEAD=[0,0,329.63,0,392,0,440,0,0,523.25,0,440,0,392,329.63,0];
+  if(BASS[s])this.tone(BASS[s],t,0.21,'square',0.05,0,this.mus);
+  if(s%2===1)this.nz(t,0.03,0.02,'highpass',6000,this.mus);
+  if(s>=16&&LEAD[s-16])this.tone(LEAD[s-16],t,0.2,'triangle',0.04,0,this.mus);},
+ jump(){if(this.ctx)this.tone(210,this.ctx.currentTime,0.12,'square',0.07,430);},
+ sw(pol){if(!this.ctx)return;const t=this.ctx.currentTime;
+  this.tone(pol>0?540:660,t,0.05,'square',0.06);
+  this.tone(pol>0?810:440,t+0.055,0.06,'square',0.06);},
+ stick(){if(!this.ctx)return;const t=this.ctx.currentTime;
+  this.tone(760,t,0.06,'square',0.06,980);this.tone(500,t+0.05,0.07,'square',0.05);},
+ die(){if(!this.ctx)return;const t=this.ctx.currentTime;
+  this.tone(320,t,0.4,'sawtooth',0.08,50);this.nz(t,0.3,0.06,'lowpass',900);},
+ chk(){if(!this.ctx)return;const t=this.ctx.currentTime;
+  this.tone(660,t,0.08,'triangle',0.07);this.tone(990,t+0.09,0.15,'triangle',0.07);},
+ win(){if(!this.ctx)return;const t=this.ctx.currentTime;
+  [523.25,659.25,783.99,1046.5,1318.5].forEach((f,i)=>this.tone(f,t+i*0.11,0.22,'triangle',0.07));},
+ land(){if(this.ctx)this.nz(this.ctx.currentTime,0.05,0.045,'lowpass',420);}};
+
+/* ================= 粒子池 ================= */
+const POOL=[],FREE=[];
+for(let i=0;i<512;i++){POOL.push({i,x:0,y:0,vx:0,vy:0,life:0,max:1,col:'#fff',s:1,g:0});FREE.push(i);}
+function spawnP(x,y,vx,vy,life,col,s,g){if(!FREE.length)return;const p=POOL[FREE.pop()];
+ p.x=x;p.y=y;p.vx=vx;p.vy=vy;p.life=life;p.max=life;p.col=col;p.s=s;p.g=g||0;}
+function updParts(dt){for(const p of POOL){if(p.life<=0)continue;
+ p.life-=dt;if(p.life<=0){FREE.push(p.i);continue;}
+ p.vy+=p.g*dt;p.x+=p.vx*dt;p.y+=p.vy*dt;}}
+
+/* ================= 玩家 ================= */
+const pl={x:0,y:0,w:10,h:13,vx:0,vy:0,onG:true,coyote:0,pol:1,face:1,
+ animT:0,dead:false,deadT:0,jumpT:0,stick:null,peel:0,
+ noStick:{c:-9,r:-9,t:0},newBest:false};
+
+/* ================= 关卡数据 ================= */
+/* 砖块：# 实心  ^ 尖刺  n 磁力墙N极(+)  s 磁力墙S极(−) */
+const LEVELS=[
+(()=>{const LW=120,g=[];for(let r=0;r<17;r++)g.push(new Array(LW).fill('.'));
+ const rect=(c0,r0,c1,r1,ch)=>{for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++)g[r][c]=ch;};
+ rect(0,13,21,16,'#');rect(8,12,9,12,'#');rect(11,11,12,12,'#');
+ /* 深渊 22~27 */
+ rect(28,13,61,16,'#');rect(50,8,51,12,'#');rect(55,12,57,12,'^');
+ /* 深渊1 62~69 · 岛 70~72 · 深渊2 73~80 */
+ rect(70,13,72,16,'#');rect(81,13,119,16,'#');
+ return{name:'荡跃',LW,grid:g,
+  balls:[{x:400,y:120,pol:-1,pw:1},{x:760,y:200,pol:1,pw:0.9},
+   {x:1056,y:120,pol:-1,pw:1},{x:1232,y:120,pol:1,pw:1}],
+  flags:[{c:19,r:13},{c:29,r:13},{c:53,r:13},{c:71,r:13}],
+  door:{x:1760,y:160,w:32,h:48},
+  hints:[{x:24,y:150,t:'A / D 移动 · W 跳跃'},{x:286,y:130,t:'空格 切换磁极'},
+   {x:286,y:144,t:'异极相吸 · 同极相斥'},{x:690,y:140,t:'切同极 · 弹射上墙'},
+   {x:950,y:118,t:'荡过深渊！'},{x:1118,y:106,t:'再切换 · 荡向下一球'}],
+  spawn:{x:32,r:13}};})(),
+(()=>{const LW=140,g=[];for(let r=0;r<17;r++)g.push(new Array(LW).fill('.'));
+ const rect=(c0,r0,c1,r1,ch)=>{for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++)g[r][c]=ch;};
+ rect(0,13,19,16,'#');
+ /* 深渊 20~25 */
+ rect(26,13,37,16,'#');
+ rect(38,13,42,13,'^');rect(38,14,42,16,'#');     /* B 尖刺坑 */
+ rect(43,9,43,12,'n');                             /* B 磁力墙 N */
+ rect(44,8,55,8,'#');rect(44,13,55,16,'#');       /* B 平台+底 */
+ rect(56,10,56,12,'n');                            /* C 左墙 N */
+ rect(56,13,60,16,'#');                            /* C 井底 */
+ rect(60,6,60,12,'s');                             /* C 右墙 S */
+ rect(61,5,68,5,'#');rect(61,6,68,16,'#');        /* C 平台+柱 */
+ rect(69,3,91,3,'s');                              /* D 磁力天花板 S */
+ rect(91,8,97,8,'#');                              /* D 落点平台 */
+ /* E 深渊 98~103 */
+ rect(104,13,139,16,'#');
+ rect(110,9,110,12,'n');                           /* E 磁力墙 N */
+ rect(111,8,116,8,'#');                            /* E 平台 */
+ rect(118,9,128,9,'s');                            /* E 磁力天花板 S */
+ rect(118,13,128,13,'^');rect(118,14,128,16,'#'); /* E 尖刺坑 */
+ return{name:'磁壁',LW,grid:g,
+  balls:[{x:368,y:120,pol:-1,pw:1},{x:1616,y:110,pol:-1,pw:1}],
+  flags:[{c:27,r:13},{c:54,r:8},{c:67,r:5},{c:94,r:8},{c:106,r:13}],
+  door:{x:2128,y:160,w:32,h:48},
+  hints:[{x:24,y:150,t:'A / D 移动 · W 跳跃'},{x:262,y:126,t:'空格 切换磁极'},
+   {x:524,y:114,t:'极性相反 · 跳向磁力墙'},{x:756,y:92,t:'W / S 攀爬 · 空格 弹开'},
+   {x:852,y:182,t:'空格 · 弹向对面墙'},{x:1062,y:76,t:'跳起吸顶 · 倒挂行走'},
+   {x:1372,y:54,t:'尽头按 S 落下'},{x:1552,y:102,t:'磁力摆荡'},
+   {x:1682,y:138,t:'磁力墙翻越'},{x:1828,y:94,t:'吸顶越过刺坑'}],
+  spawn:{x:32,r:13}};})()];
+
+let curL=LEVELS[0],curIdx=0;
+function getBest(i){try{const v=+localStorage.getItem('polarity_best_'+i);return v>0?v:0;}catch(e){return 0;}}
+function setBest(i,t){try{localStorage.setItem('polarity_best_'+i,t);}catch(e){}}
+function bestStr(i){const b=getBest(i);return b?fmt(b):'--:--';}
+function fmt(t){const m=fl(t/60),s=fl(t%60),d=fl((t*10)%10);return m+':'+(s<10?'0':'')+s+'.'+d;}
+
+function startGame(i){curIdx=i;curL=LEVELS[i];
+ state='play';paused=false;time=0;deaths=0;curCP=-1;
+ curL.flags.forEach(f=>{f.x=f.c*16+8;f.y=f.r*16;f.on=false;});
+ respawn();}
+function respawn(){
+ const s=curCP<0?{x:curL.spawn.x,r:curL.spawn.r}:{x:curL.flags[curCP].c*16+3,r:curL.flags[curCP].r};
+ pl.x=s.x;pl.y=s.r*16-14;plPX=pl.x;plPY=pl.y;
+ pl.vx=0;pl.vy=0;pl.pol=1;pl.dead=false;pl.onG=true;pl.face=1;pl.animT=0;
+ pl.stick=null;pl.peel=0;pl.noStick={c:-9,r:-9,t:0};
+ camX=clamp(pl.x+26-VW/2,0,curL.LW*16-VW);camPX=camX;}
+function die(){if(pl.dead)return;pl.dead=true;pl.deadT=0.7;deaths++;deathAt=gtime;
+ pl.stick=null;switchQ=false;jumpBuf=0;AU.die();
+ for(let i=0;i<24;i++){const a=Math.random()*6.283,sp=60+Math.random()*160;
+  spawnP(pl.x+5,pl.y+6,Math.cos(a)*sp,Math.sin(a)*sp,0.5,i%2?'#ffffff':'#888888',1,400);}}
+
+/* ================= 瓦片与碰撞 ================= */
+const isMagT=t=>t==='n'||t==='s';
+const polOf=t=>t==='n'?1:-1;
+const solidT=t=>t==='#'||t==='n'||t==='s';
+function tile(c,r){if(c<0||c>=curL.LW)return'#';if(r<0||r>=17)return'.';return curL.grid[r][c];}
+const solid=(c,r)=>solidT(tile(c,r));
+const noStickBlock=(c,r)=>pl.noStick.t>0&&c===pl.noStick.c&&r===pl.noStick.r;
+
+function tryStick(c,r,side){          /* 碰到磁力墙且异极 → 吸附 */
+ if(pl.stick)return false;
+ const t=tile(c,r);if(!isMagT(t))return false;
+ if(polOf(t)===pl.pol)return false;
+ if(noStickBlock(c,r))return false;
+ pl.stick={side,c,r};pl.vx=0;pl.vy=0;pl.peel=0;pl.onG=false;
+ if(side==='left')pl.face=-1;else if(side==='right')pl.face=1;
+ AU.stick();
+ for(let i=0;i<8;i++){const a=Math.random()*6.283,sp=30+Math.random()*70;
+  spawnP(pl.x+5,pl.y+6,Math.cos(a)*sp,Math.sin(a)*sp,0.25,'#ffffff',1,0);}
+ return true;}
+
+function moveCollide(dx,dy){
+ pl.x+=dx;
+ if(dx>0){const c=fl((pl.x+pl.w)/TILE),r0=fl(pl.y/TILE),r1=fl((pl.y+pl.h-0.01)/TILE);let hit=false;
+  for(let r=r0;r<=r1;r++)if(solid(c,r)){pl.x=c*TILE-pl.w-0.01;hit=true;
+   if(tryStick(c,r,'right'))return true;}
+  if(hit)pl.vx=0;}
+ else if(dx<0){const c=fl(pl.x/TILE),r0=fl(pl.y/TILE),r1=fl((pl.y+pl.h-0.01)/TILE);let hit=false;
+  for(let r=r0;r<=r1;r++)if(solid(c,r)){pl.x=(c+1)*TILE+0.01;hit=true;
+   if(tryStick(c,r,'left'))return true;}
+  if(hit)pl.vx=0;}
+ pl.x=clamp(pl.x,0,curL.LW*TILE-pl.w);
+ pl.y+=dy;
+ if(dy>0){const r=fl((pl.y+pl.h)/TILE),c0=fl(pl.x/TILE),c1=fl((pl.x+pl.w-0.01)/TILE);
+  for(let c=c0;c<=c1;c++)if(solid(c,r)){pl.y=r*TILE-pl.h-0.01;pl.vy=0;pl.onG=true;break;}}
+ else if(dy<0){const r=fl(pl.y/TILE),c0=fl(pl.x/TILE),c1=fl((pl.x+pl.w-0.01)/TILE);let hit=false;
+  for(let c=c0;c<=c1;c++)if(solid(c,r)){pl.y=(r+1)*TILE+0.01;hit=true;
+   if(tryStick(c,r,'top'))return true;}
+  if(hit)pl.vy=0;}
+ return false;}
+
+/* ================= 磁力墙系统 ================= */
+function wallAttract(dt){              /* 空中且2格内有异极墙 → 朝墙吸力 */
+ if(pl.onG)return 0;
+ const cx=pl.x+pl.w/2,cy=pl.y+pl.h/2,RG=P.wallRange;
+ const c0=fl((cx-RG)/16)-1,c1=fl((cx+RG)/16)+1,r0=fl((cy-RG)/16)-1,r1=fl((cy+RG)/16)+1;
+ let bx=0,by=0,bd=1e9;
+ for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++){
+  const t=tile(c,r);if(!isMagT(t)||polOf(t)===pl.pol||noStickBlock(c,r))continue;
+  const nx=clamp(cx,c*16,c*16+16),ny=clamp(cy,r*16,r*16+16);
+  const dx=nx-cx,dy=ny-cy,d=Math.hypot(dx,dy);
+  if(d<bd){bd=d;bx=dx;by=dy;}}
+ if(bd<=RG&&bd>0.01){
+  pl.vx+=bx/bd*P.wallPull*dt;pl.vy+=by/bd*P.wallPull*dt;
+  if(Math.random()<0.4&&FREE.length>30)
+   spawnP(cx,cy,bx/bd*(60+Math.random()*50),by/bd*(60+Math.random()*50),0.3,'rgba(120,225,255,1)',1,0);
+  return P.wallPull*0.6;}
+ return 0;}
+function stillNear(){                  /* 贴墙维持检查 */
+ const c0=fl((pl.x-20)/16),c1=fl((pl.x+pl.w+20)/16),r0=fl((pl.y-20)/16),r1=fl((pl.y+pl.h+20)/16);
+ for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++){const t=tile(c,r);
+  if(isMagT(t)&&polOf(t)!==pl.pol)return true;}
+ return false;}
+function stickUpdate(dt){
+ const st=pl.stick;
+ if(!stillNear()){pl.stick=null;return;}
+ pl.vx=0;pl.vy=0;pl.onG=false;
+ let mx=0,my=0;
+ if(st.side==='top'){if(keys.a)mx=-P.climbSpd;if(keys.d)mx=P.climbSpd;}
+ else{if(keys.w)my=-P.climbSpd;if(keys.s)my=P.climbSpd;
+  pl.face=st.side==='left'?-1:1;}
+ if(mx||my){const n=Math.max(1,Math.ceil(Math.max(Math.abs(mx),Math.abs(my))*dt/4));
+  for(let i=0;i<n;i++)moveCollide(mx*dt/n,my*dt/n);}
+ /* 竖墙爬到顶 → 翻越 */
+ if(st.side!=='top'){
+  let rr=clamp(fl((pl.y+pl.h-2)/16),0,16);
+  while(rr>0&&isMagT(tile(st.c,rr-1)))rr--;
+  const topY=rr*16;
+  if(pl.y<=topY+2){
+   if(!solid(st.c,rr-1)&&!solid(st.c,rr-2)){
+    pl.stick=null;
+    pl.x=st.c*16+3;pl.y=topY-pl.h-0.5;
+    pl.vx=(st.side==='left'?-1:1)*60;pl.vy=-140;pl.onG=false;
+    pl.noStick={c:st.c,r:rr,t:0.4};
+    AU.jump();
+    for(let i=0;i<6;i++)spawnP(pl.x+5,pl.y+12,(Math.random()-0.5)*60,-Math.random()*50,0.3,'#dddddd',1,300);
+    return;}
+   else pl.y=topY+2.5;}}
+ /* 按住背离方向 0.15s → 轻柔脱离 */
+ const ak=st.side==='left'?'d':st.side==='right'?'a':'s';
+ if(keys[ak]){pl.peel+=dt;
+  if(pl.peel>=P.peelT){const s2=pl.stick;pl.stick=null;pl.peel=0;
+   pl.noStick={c:s2.c,r:s2.r,t:0.25};
+   if(s2.side==='top')pl.vy=60;}}
+ else pl.peel=0;
+ if(Math.random()<0.4&&FREE.length>30){
+  const px=pl.x+5,py=pl.y+6;
+  if(st.side==='top')spawnP(px+(Math.random()-0.5)*10,py+8,(Math.random()-0.5)*30,20+Math.random()*30,0.4,'rgba(120,225,255,1)',1,0);
+  else spawnP(px+(st.side==='left'?-6:6),py+(Math.random()-0.5)*10,0,(Math.random()-0.5)*40,0.4,'rgba(120,225,255,1)',1,0);}
+ AU.hum(0.5);}
+
+/* ================= 物理帧 ================= */
+function physics(dt){
+ time+=dt;plPX=pl.x;plPY=pl.y;camPX=camX;jumpBuf-=dt;
+ pl.noStick.t-=dt;
+ if(pl.dead){pl.deadT-=dt;AU.hum(0);if(pl.deadT<=0)respawn();return;}
+ /* 切极（附墙时 = 弹开） */
+ if(switchQ){switchQ=false;pl.pol*=-1;AU.sw(pl.pol);
+  for(let i=0;i<10;i++){const a=Math.random()*6.283,sp=40+Math.random()*80;
+   spawnP(pl.x+5,pl.y+6,Math.cos(a)*sp,Math.sin(a)*sp,0.28,'#ffffff',1,0);}
+  if(pl.stick){const st=pl.stick;pl.stick=null;pl.peel=0;
+   if(st.side==='left'){pl.vx=P.wallKick;pl.vy=-60;}
+   else if(st.side==='right'){pl.vx=-P.wallKick;pl.vy=-60;}
+   else pl.vy=P.wallKick*0.85;
+   pl.onG=false;
+   pl.noStick={c:st.c,r:st.r,t:P.wallCool};}}
+ if(pl.stick)stickUpdate(dt);
+ else{
+  /* 磁力球力（线性衰减） */
+  let mf=0;const pcx=pl.x+pl.w/2,pcy=pl.y+pl.h/2;
+  for(const b of curL.balls){
+   const dx=b.x-pcx,dy=b.y-pcy,d=Math.hypot(dx,dy);
+   if(d>0.001&&d<P.magR){
+    const a=P.magA*b.pw*(1-d/P.magR),s=(b.pol===pl.pol)?-1:1;
+    pl.vx+=dx/d*a*s*dt;pl.vy+=dy/d*a*s*dt;mf+=a;
+    if(FREE.length>40)for(let i=0;i<2;i++){
+     const t=0.2+Math.random()*0.6,sx=lerp(pcx,b.x,t),sy=lerp(pcy,b.y,t);
+     if(s>0){const dd=Math.hypot(b.x-sx,b.y-sy)||1;
+      spawnP(sx,sy,(b.x-sx)/dd*(90+Math.random()*70),(b.y-sy)/dd*(90+Math.random()*70),0.32,'rgba(120,225,255,1)',1,0);}
+     else{const dd=Math.hypot(sx-b.x,sy-b.y)||1;
+      spawnP(sx,sy,(sx-b.x)/dd*(90+Math.random()*70),(sy-b.y)/dd*(90+Math.random()*70),0.32,'rgba(255,150,70,1)',1,0);}}}}
+  mf+=wallAttract(dt);
+  AU.hum(clamp(mf/3000,0,1));
+  /* 输入 */
+  const ax=(keys.d||keys.arrowright?1:0)-(keys.a||keys.arrowleft?1:0);
+  if(ax!==0){pl.face=ax;const acc=P.moveAccel*(pl.onG?1:P.airControl)*dt,nv=pl.vx+ax*acc;
+   if(nv*ax>0){if(Math.abs(nv)<=P.maxRun)pl.vx=nv;
+    else if(Math.abs(pl.vx)<=P.maxRun)pl.vx=ax*P.maxRun;}
+   else pl.vx=nv;}
+  else if(pl.onG){const f=P.friction*dt;
+   if(Math.abs(pl.vx)<=f)pl.vx=0;else pl.vx-=Math.sign(pl.vx)*f;}
+  /* 跳跃 */
+  pl.coyote=pl.onG?0.09:pl.coyote-dt;
+  pl.jumpT-=dt;
+  if(jumpBuf>0&&pl.coyote>0){pl.vy=-P.jumpVel;jumpBuf=0;pl.coyote=0;
+   pl.jumpT=0.22;pl.onG=false;AU.jump();}
+  if(pl.jumpT>0&&pl.vy<-150&&!(keys.w||keys.arrowup)){pl.vy=-150;pl.jumpT=0;}
+  pl.vy+=P.gravity*(((keys.s||keys.arrowdown)&&pl.vy>0)?P.fastFall:1)*dt;
+  const mfl=(keys.s||keys.arrowdown)?P.maxFall*1.5:P.maxFall;
+  if(pl.vy>mfl)pl.vy=mfl;
+  const spd=Math.hypot(pl.vx,pl.vy);
+  if(spd>P.maxSpeed){pl.vx*=P.maxSpeed/spd;pl.vy*=P.maxSpeed/spd;}
+  /* 移动+碰撞（子步长） */
+  const wasVy=pl.vy;pl.onG=false;
+  const dx=pl.vx*dt,dy=pl.vy*dt;
+  const n=Math.max(1,Math.ceil(Math.max(Math.abs(dx),Math.abs(dy))/4));
+  let stuck=false;
+  for(let i=0;i<n&&!stuck;i++)stuck=moveCollide(dx/n,dy/n);
+  if(pl.onG&&wasVy>170){AU.land();
+   for(let i=0;i<5;i++)spawnP(pl.x+Math.random()*10,pl.y+12,
+    (Math.random()-0.5)*50,-Math.random()*40,0.25,'#bbbbbb',1,350);}}
+ pl.animT+=pl.stick?dt*5:Math.abs(pl.vx)*dt/16;
+ /* 尖刺/坠落 */
+ {const c0=fl((pl.x+3)/16),c1=fl((pl.x+pl.w-3)/16),r0=fl((pl.y+4)/16),r1=fl((pl.y+pl.h-1)/16);
+  outer:for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++)
+   if(tile(c,r)==='^'){die();break outer;}}
+ if(pl.y>17*16+60)die();
+ if(pl.dead)return;
+ /* 检查点 */
+ for(let i=0;i<curL.flags.length;i++){const f=curL.flags[i];
+  if(!f.on&&Math.abs(pl.x+pl.w/2-f.x)<14&&pl.y+pl.h>f.y-20&&pl.y<f.y+4){
+   f.on=true;curCP=i;AU.chk();
+   for(let k=0;k<12;k++){const a=Math.random()*6.283;
+    spawnP(f.x,f.y-8,Math.cos(a)*60,Math.sin(a)*60-30,0.4,'#ffffff',1,220);}}}
+ /* 终点 */
+ const d=curL.door;
+ if(pl.x+pl.w>d.x+4&&pl.x<d.x+d.w-4&&pl.y+pl.h>d.y+4&&pl.y<d.y+d.h){
+  state='win';AU.win();AU.hum(0);
+  const b=getBest(curIdx);pl.newBest=!b||time<b;
+  if(pl.newBest)setBest(curIdx,time);
+  return;}
+ /* 环境粒子 */
+ curL.balls.forEach((b,i)=>{b.pt=(b.pt||0)-dt;
+  if(b.pt<=0){b.pt=0.13+Math.random()*0.08;const a=Math.random()*6.283;
+   spawnP(b.x+Math.cos(a)*10,b.y+Math.sin(a)*10,Math.cos(a+1.57)*24,Math.sin(a+1.57)*24,0.5,'#5a5a5a',1,0);}});
+ if(Math.random()<0.25)spawnP(d.x+4+Math.random()*24,d.y+42,
+  (Math.random()-0.5)*8,-25-Math.random()*20,0.9,'#cfcfcf',1,-20);
+ /* 相机 */
+ const tgt=clamp(pl.x+pl.w/2+pl.face*26-VW/2,0,curL.LW*16-VW);
+ camX+=(tgt-camX)*Math.min(1,dt*7);}
+
+/* ================= 像素素材（代码生成） ================= */
+const PAL={W:'#f2f2f2',G:'#a8a8a8',D:'#606060'};
+function px(map){const rows=map.map(r=>(r+'................').slice(0,16));
+ const c=document.createElement('canvas');c.width=c.height=16;
+ const g=c.getContext('2d');
+ rows.forEach((row,y)=>{for(let x=0;x<16;x++){const ch=row[x];
+  if(PAL[ch]){g.fillStyle=PAL[ch];g.fillRect(x,y,1,1);}}});
+ return c;}
+const topRows=['................','................','.....WWWW.......','....WWWWWW......',
+ '....WGGGGW......','....WWWWWW......','.....WWWW.......','....WWWWWW......',
+ '...DWWWWWWD.....','...DWWWWWWD.....','....WWWWWW......'];
+const SPR={
+ idle:px([...topRows,'....WW..WW......','....WW..WW......','....WW..WW......','...DWW..WWD.....','................']),
+ run :px([...topRows,'....WW..WW......','...WW....WW.....','...WW....WW.....','..DWW....WWD....','................']),
+ jump:px([...topRows,'....WW..WW......','...DWW..WWD.....','...WW....WW.....','................','................'])};
+const TILEC=(()=>{const c=document.createElement('canvas');c.width=c.height=16;
+ const g=c.getContext('2d');
+ g.fillStyle='#232323';g.fillRect(0,0,16,16);
+ g.fillStyle='#3d3d3d';g.fillRect(1,1,14,14);
+ g.fillStyle='#4c4c4c';g.fillRect(1,1,14,2);g.fillRect(1,1,2,14);
+ g.fillStyle='#161616';g.fillRect(14,2,1,13);g.fillRect(2,14,13,1);
+ g.fillStyle='#333333';g.fillRect(5,5,2,2);g.fillRect(10,9,2,2);
+ return c;})();
+const SPIKEC=(()=>{const c=document.createElement('canvas');c.width=c.height=16;
+ const g=c.getContext('2d');g.fillStyle='#c9c9c9';
+ for(let i=0;i<11;i++){const w=Math.max(2,R(i*1.3));g.fillRect(8-(w>>1),5+i,w,1);}
+ g.fillStyle='#555555';g.fillRect(0,15,16,1);return c;})();
+function ballSprite(pol){const c=document.createElement('canvas');c.width=c.height=20;
+ const g=c.getContext('2d'),cx=10,cy=10;
+ for(let y=-8;y<=8;y++)for(let x=-8;x<=8;x++){const d=Math.sqrt(x*x+y*y);
+  if(d>6.2&&d<7.8){g.fillStyle='#f0f0f0';g.fillRect(cx+x,cy+y,1,1);}}
+ g.fillStyle='#f0f0f0';
+ if(pol>0){g.fillRect(cx-1,cy-4,2,8);g.fillRect(cx-4,cy-1,8,2);
+  g.fillStyle='#7a7a7a';
+  for(let a=0;a<8;a++)g.fillRect(cx+R(Math.cos(a*0.785)*9),cy+R(Math.sin(a*0.785)*9),1,1);}
+ else{g.fillRect(cx-4,cy-1,8,2);g.fillStyle='#7a7a7a';
+  g.fillRect(cx-9,cy,2,1);g.fillRect(cx+8,cy,2,1);g.fillRect(cx,cy-9,1,2);g.fillRect(cx,cy+8,1,2);}
+ return c;}
+const BALLSP=[ballSprite(-1),ballSprite(1)];
+function wallTileC(pol){const c=document.createElement('canvas');c.width=c.height=16;
+ const g=c.getContext('2d');
+ g.fillStyle='#181818';g.fillRect(0,0,16,16);
+ g.fillStyle='#2c2c2c';
+ for(let y=0;y<16;y++)for(let x=0;x<16;x++)if((x+y)%5===0)g.fillRect(x,y,1,1);
+ g.fillStyle='#e8e8e8';
+ if(pol>0){g.fillRect(7,4,2,8);g.fillRect(4,7,8,2);}else g.fillRect(4,7,8,2);
+ g.fillStyle=pol>0?'#59d8ff':'#ff9b52';
+ g.fillRect(0,0,16,1);g.fillRect(0,15,16,1);g.fillRect(0,0,1,16);g.fillRect(15,0,1,16);
+ return c;}
+const WALLC=[wallTileC(1),wallTileC(-1)];
+const stars=[];for(let i=0;i<70;i++)stars.push({x:Math.random()*1920,y:Math.random()*250,
+ s:Math.random()<0.3?2:1,b:Math.random()<0.5?'#3a3a3a':'#585858'});
+const MOON=(()=>{const c=document.createElement('canvas');c.width=c.height=44;
+ const g=c.getContext('2d');
+ for(let y=-21;y<=21;y++)for(let x=-21;x<=21;x++){const d=Math.sqrt(x*x+y*y);
+  if(d<20){g.fillStyle=d>18.6?'#c8c8c8':'#8e8e8e';g.fillRect(22+x,22+y,1,1);}}
+ g.fillStyle='#6f6f6f';g.fillRect(14,16,4,4);g.fillRect(26,24,3,3);g.fillRect(20,10,2,2);
+ return c;})();
+
+/* ================= 世界层渲染 ================= */
+function renderWorld(alpha){
+ wg.fillStyle='#000';wg.fillRect(0,0,VW,VH);
+ const cx=R(lerp(camPX,camX,alpha));camRX=cx;
+ wg.drawImage(MOON,R(372-cx*0.12),24);
+ for(const st of stars){const m=((st.x-cx*0.3)%1920+1920)%1920;
+  if(m<VW){wg.fillStyle=st.b;wg.fillRect(R(m),R(st.y),st.s,st.s);}}
+ wg.save();wg.translate(-cx,0);
+ const c0=Math.max(0,fl(cx/16)),c1=Math.min(curL.LW-1,c0+31);
+ for(let r=0;r<17;r++)for(let c=c0;c<=c1;c++){const t=curL.grid[r][c];
+  if(t==='#'){wg.drawImage(TILEC,c*16,r*16);
+   if(!solid(c,r-1)){wg.fillStyle='#8f8f8f';wg.fillRect(c*16,r*16,16,2);}}
+  else if(t==='^')wg.drawImage(SPIKEC,c*16,r*16);
+  else if(t==='n')wg.drawImage(WALLC[0],c*16,r*16);
+  else if(t==='s')wg.drawImage(WALLC[1],c*16,r*16);}
+ /* 终点门 */
+ const d=curL.door;
+ wg.fillStyle='#e8e8e8';
+ wg.fillRect(d.x,d.y,32,2);wg.fillRect(d.x,d.y+46,32,2);
+ wg.fillRect(d.x,d.y,2,48);wg.fillRect(d.x+30,d.y,2,48);
+ wg.fillStyle='#1c1c1c';wg.fillRect(d.x+2,d.y+2,28,44);
+ wg.fillStyle='#dcdcdc';
+ for(let i=0;i<4;i++){const yy=d.y+4+((gtime*26+i*12)%44);
+  wg.globalAlpha=0.3+0.3*Math.abs(Math.sin(gtime*4+i));
+  wg.fillRect(d.x+3,R(yy),26,1);}
+ wg.globalAlpha=1;
+ /* 检查点 */
+ for(const f of curL.flags){wg.fillStyle=f.on?'#f2f2f2':'#5c5c5c';
+  wg.fillRect(f.x-1,f.y-16,2,16);
+  wg.fillRect(f.x+1,f.y-15,f.on?7:5,3);
+  wg.fillRect(f.x+1,f.y-12,f.on?5:4,2);}
+ /* 磁力球 */
+ curL.balls.forEach((b,i)=>{const pu=0.5+0.5*Math.sin(gtime*3+i*1.9);
+  wg.globalAlpha=0.05+0.05*pu;wg.fillStyle='#ffffff';
+  wg.beginPath();wg.arc(b.x,b.y,11+pu*2,0,6.2832);wg.fill();
+  wg.globalAlpha=1;wg.drawImage(BALLSP[b.pol>0?1:0],R(b.x-10),R(b.y-10));});
+ /* 粒子 */
+ for(const p of POOL){if(p.life<=0)continue;
+  wg.globalAlpha=clamp(p.life/p.max,0,1);wg.fillStyle=p.col;
+  wg.fillRect(R(p.x),R(p.y),p.s,p.s);}
+ wg.globalAlpha=1;
+ /* 玩家 */
+ if(!pl.dead){
+  const ix=R(lerp(plPX,pl.x,alpha)),iy=R(lerp(plPY,pl.y,alpha));
+  let spr=SPR.idle;
+  if(pl.stick||!pl.onG)spr=SPR.jump;
+  else if(Math.abs(pl.vx)>12)spr=(fl(pl.animT)%2)?SPR.run:SPR.idle;
+  const flip=pl.stick&&pl.stick.side==='top';
+  wg.save();wg.translate(ix+5,iy+6);wg.scale(pl.face,flip?-1:1);
+  wg.drawImage(spr,-8,-8);
+  wg.fillStyle='#fff';
+  if(pl.pol>0){wg.fillRect(-2,-12,5,1);wg.fillRect(0,-14,1,5);}
+  else wg.fillRect(-2,-11,5,1);
+  wg.restore();}
+ wg.restore();
+ const fA=0.4-(gtime-deathAt);
+ if(fA>0){wg.fillStyle='rgba(255,255,255,'+clamp(fA,0,0.35)+')';wg.fillRect(0,0,VW,VH);}}
+
+/* ================= 高清文字层 ================= */
+function renderUI(){
+ const dpr=window.devicePixelRatio||1,W=innerWidth,H=innerHeight;
+ if(cv.width!==(W*dpr|0)||cv.height!==(H*dpr|0)){cv.width=W*dpr|0;cv.height=H*dpr|0;
+  cv.style.width=W+'px';cv.style.height=H+'px';}
+ ctx.setTransform(dpr,0,0,dpr,0,0);
+ ctx.imageSmoothingEnabled=false;
+ ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);
+ let s=Math.min(W/VW,H/VH);s=s>=1?Math.max(1,fl(s)):s;
+ const ox=fl((W-VW*s)/2),oy=fl((H-VH*s)/2);
+ VIEW={s,ox,oy};
+ ctx.drawImage(wc,0,0,VW,VH,ox,oy,VW*s,VH*s);
+ const fs=Math.max(12,Math.round(7.5*s)),fs2=Math.max(10,Math.round(6.5*s));
+ const CX=ox+VW*s/2;
+ function T(t,x,y,sz,col,al,bd){ctx.font=(bd?'bold ':'')+sz+'px "Courier New",monospace';
+  ctx.fillStyle=col;ctx.textAlign=al||'left';ctx.fillText(t,x,y);ctx.textAlign='left';}
+ if(state==='play'||state==='win'){
+  for(const h of curL.hints){const sx=h.x-camRX;
+   if(sx>-170&&sx<VW+30)T(h.t,ox+sx*s,oy+h.y*s,fs2,'#8f8f8f');}
+  T('第'+(curIdx+1)+'关 · '+curL.name,ox+6*s,oy+5*s,fs,'#d8d8d8');
+  T('TIME '+fmt(time)+'   死亡 ×'+deaths,ox+6*s,oy+18*s,fs,'#9a9a9a');
+  const px2=ox+VW*s-26*s,py2=oy+6*s;
+  ctx.strokeStyle='#8a8a8a';ctx.lineWidth=Math.max(1,s*0.8);
+  ctx.strokeRect(px2,py2,18*s,18*s);
+  ctx.fillStyle='#f2f2f2';
+  if(pl.pol>0){ctx.fillRect(px2+4.5*s,py2+8*s,9*s,2*s);ctx.fillRect(px2+8*s,py2+4.5*s,2*s,9*s);}
+  else ctx.fillRect(px2+4.5*s,py2+8*s,9*s,2*s);
+  T('磁极',px2+1*s,py2+20*s,fs2,'#8a8a8a');
+  if(muted)T('静音',px2+1*s,py2+32*s,fs2,'#777');}
+ if(state==='title'){
+  ctx.fillStyle='rgba(0,0,0,0.62)';ctx.fillRect(ox,oy,VW*s,VH*s);
+  T('POLARITY',CX,oy+52*s,Math.max(18,Math.round(15*s)),'#f2f2f2','center',true);
+  T('磁 极',CX,oy+90*s,Math.max(11,Math.round(7*s)),'#bdbdbd','center');
+  T('v2.0 · 磁力闯关 · 黑白像素',CX,oy+110*s,fs2,'#7a7a7a','center');
+  LEVELS.forEach((L,i)=>T((i+1)+' · '+L.name+'      最佳 '+bestStr(i),CX,oy+(142+i*15)*s,fs,'#cfcfcf','center'));
+  T('按 [1] / [2] 选择关卡开始',CX,oy+184*s,fs,'#f2f2f2','center',true);
+  T('A/D 移动 · W 跳跃 · S 速降 · 空格 切换磁极',CX,oy+210*s,fs2,'#8a8a8a','center');
+  T('空中贴近异极磁力墙即吸附 · W/S 攀爬 · 空格 弹开',CX,oy+222*s,fs2,'#8a8a8a','center');
+  T('M 静音 · P 暂停 · R 重开 · F1 调试',CX,oy+234*s,fs2,'#666','center');}
+ if(state==='win'){
+  ctx.fillStyle='rgba(0,0,0,0.62)';ctx.fillRect(ox,oy,VW*s,VH*s);
+  const last=curIdx+1>=LEVELS.length;
+  T(last?'全部通关！':'通 关 !',CX,oy+78*s,Math.max(14,Math.round(11*s)),'#f2f2f2','center',true);
+  T('第'+(curIdx+1)+'关 · '+curL.name,CX,oy+108*s,fs,'#cfcfcf','center');
+  T('TIME '+fmt(time)+(pl.newBest?'  新纪录！':'')+'   死亡 ×'+deaths,CX,oy+126*s,fs,'#cfcfcf','center');
+  T('最佳 '+bestStr(curIdx),CX,oy+142*s,fs2,'#8a8a8a','center');
+  T(last?'[R] 重玩    [T] 返回标题':'[N] 下一关    [R] 重玩    [T] 标题',CX,oy+170*s,fs,'#f2f2f2','center');}
+ if(paused&&state==='play'){
+  ctx.fillStyle='rgba(0,0,0,0.55)';ctx.fillRect(ox,oy,VW*s,VH*s);
+  T('已暂停',CX,oy+118*s,Math.max(14,Math.round(10*s)),'#eee','center',true);
+  T('按 P 继续',CX,oy+140*s,fs2,'#999','center');}
+ if(debugOn){
+  const dx0=ox+6*s,dy0=oy+44*s;
+  ctx.fillStyle='rgba(0,0,0,0.72)';ctx.fillRect(dx0-4,dy0-4,176*s,(16+DBG.length*12)*s);
+  DBG.forEach((d,i)=>T((i===dbgSel?'> ':'  ')+d[0]+' = '+R(P[d[0]]),dx0,dy0+i*12*s,fs2,i===dbgSel?'#fff':'#8a8a8a'));
+  T('[/] 选择  -/+ 调整  F1 关闭',dx0,dy0+DBG.length*12*s,fs2,'#666');}}
+
+/* ================= 标题粒子演示 ================= */
+function titleDemo(){if(Math.random()<0.6){
+ const bx1=VW/2-70,bx2=VW/2+70,by=176;
+ const t=0.12+Math.random()*0.76,sx=lerp(bx1,bx2,t),sy=by+(Math.random()-0.5)*14;
+ const dir=Math.sin(gtime*0.7)>0?1:-1,tx=dir>0?bx2:bx1;
+ const dd=Math.hypot(tx-sx,by-sy)||1;
+ spawnP(sx,sy,(tx-sx)/dd*(70+Math.random()*50),(by-sy)/dd*(70+Math.random()*50),
+  0.45,dir>0?'rgba(120,225,255,1)':'rgba(255,150,70,1)',1,0);}}
+
+/* ================= 输入 ================= */
+function adj(d){const g=DBG[dbgSel];P[g[0]]=clamp(P[g[0]]+d*g[3],g[1],g[2]);}
+addEventListener('keydown',e=>{
+ const k=e.key.toLowerCase();
+ if([' ','w','a','s','d','arrowup','arrowdown','arrowleft','arrowright','f1'].includes(k))e.preventDefault();
+ AU.init();keys[k]=true;
+ if(e.repeat)return;
+ if(state==='title'){
+  if(k==='1')startGame(0);
+  else if(k==='2'&&LEVELS.length>1)startGame(1);
+  else if(k==='enter'||k===' ')startGame(0);
+  return;}
+ if(state==='win'){
+  if(k==='r')startGame(curIdx);
+  else if(k==='n'&&curIdx+1<LEVELS.length)startGame(curIdx+1);
+  else if(k==='t')state='title';
+  return;}
+ if(k==='m'){muted=!muted;AU.setMute(muted);return;}
+ if(k==='p'){paused=!paused;return;}
+ if(k==='f1'||k==='`'){debugOn=!debugOn;return;}
+ if(debugOn){
+  if(k==='['){dbgSel=(dbgSel+DBG.length-1)%DBG.length;return;}
+  if(k===']'){dbgSel=(dbgSel+1)%DBG.length;return;}
+  if(k==='-'||k==='_'){adj(-1);return;}
+  if(k==='='||k==='+'){adj(1);return;}}
+ if(state!=='play'||paused)return;
+ if(k==='r'){startGame(curIdx);return;}
+ if(k===' ')switchQ=true;
+ if(k==='w'||k==='arrowup')jumpBuf=0.12;});
+addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false;});
+addEventListener('blur',()=>{for(const k in keys)keys[k]=false;});
+
+/* ================= 主循环 ================= */
+let last=performance.now(),acc=0;
+function frame(now){requestAnimationFrame(frame);
+ let dt=(now-last)/1000;last=now;if(dt>0.1)dt=0.1;gtime+=dt;
+ if(state==='play'&&!paused){acc+=dt;let n=0;
+  while(acc>=STEP&&n<6){physics(STEP);acc-=STEP;n++;}
+  if(n===6)acc=0;}else acc=0;
+ if(state==='title')titleDemo();
+ if(!paused)updParts(dt);else AU.hum(0);
+ renderWorld(clamp(acc/STEP,0,1));
+ renderUI();}
+curL=LEVELS[0];
+curL.flags.forEach(f=>{f.x=f.c*16+8;f.y=f.r*16;f.on=false;});
+respawn();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
